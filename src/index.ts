@@ -29,6 +29,7 @@ export interface PDFBuilder {
   page(width: number, height: number, fn: (ctx: PageContext) => void): void
   page(fn: (ctx: PageContext) => void): void
   build(): Uint8Array
+  buildStream(): ReadableStream<Uint8Array>
   measureText: typeof measureText
 }
 
@@ -211,13 +212,13 @@ export function pdf(): PDFBuilder {
   }
 
   let built = false
-  function build(): Uint8Array {
+
+  function finalize(): Ref {
     if (!pages.length) throw new Error('PDF must have at least one page')
     if (built) throw new Error('build() can only be called once')
     built = true
     const fontRef = addObject({ Type: '/Font', Subtype: '/Type1', BaseFont: '/Helvetica' })
     const pagesRef = addObject({ Type: '/Pages', Kids: pages, Count: pages.length })
-
     for (const obj of objects) {
       if (obj.dict.Type === '/Page') {
         obj.dict.Parent = pagesRef
@@ -225,41 +226,58 @@ export function pdf(): PDFBuilder {
         if (resources?.Font) (resources.Font as Record<string, PDFValue>).F1 = fontRef
       }
     }
+    return addObject({ Type: '/Catalog', Pages: pagesRef })
+  }
 
-    const catalogRef = addObject({ Type: '/Catalog', Pages: pagesRef })
+  function* emitChunks(catalogRef: Ref): Generator<Uint8Array> {
     const enc = new TextEncoder()
-    const chunks: Uint8Array[] = []
     const offsets: number[] = []
     let byteOffset = 0
 
-    const push = (data: string | Uint8Array) => {
-      const bytes = typeof data === 'string' ? enc.encode(data) : data
-      chunks.push(bytes); byteOffset += bytes.length
-    }
-
-    push('%PDF-1.4\n%\xFF\xFF\xFF\xFF\n')
+    const header = enc.encode('%PDF-1.4\n%\xFF\xFF\xFF\xFF\n')
+    byteOffset += header.length; yield header
     for (const obj of objects) {
       offsets[obj.id] = byteOffset
-      let head = `${obj.id} 0 obj\n${serialize(obj.dict)}\n`
-      if (obj.stream) { push(head + 'stream\n'); push(obj.stream); push('\nendstream\nendobj\n') }
-      else push(head + 'endobj\n')
+      const head = `${obj.id} 0 obj\n${serialize(obj.dict)}\n`
+      if (obj.stream) {
+        const a = enc.encode(head + 'stream\n'), b = obj.stream, c = enc.encode('\nendstream\nendobj\n')
+        const chunk = new Uint8Array(a.length + b.length + c.length)
+        chunk.set(a, 0); chunk.set(b, a.length); chunk.set(c, a.length + b.length)
+        byteOffset += chunk.length; obj.stream = null as unknown as Uint8Array; yield chunk
+      } else { const bytes = enc.encode(head + 'endobj\n'); byteOffset += bytes.length; yield bytes }
     }
 
     const xrefOffset = byteOffset
     let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
     for (let i = 1; i <= objects.length; i++)
       xref += String(offsets[i]).padStart(10, '0') + ' 00000 n \n'
-    push(xref)
-    push(`trailer\n${serialize({ Size: objects.length + 1, Root: catalogRef })}\n`)
-    push(`startxref\n${xrefOffset}\n%%EOF\n`)
+    xref += `trailer\n${serialize({ Size: objects.length + 1, Root: catalogRef })}\n`
+    xref += `startxref\n${xrefOffset}\n%%EOF\n`
+    yield enc.encode(xref)
+  }
 
-    const result = new Uint8Array(byteOffset)
+  function build(): Uint8Array {
+    const chunks: Uint8Array[] = []
+    let len = 0
+    for (const chunk of emitChunks(finalize())) { chunks.push(chunk); len += chunk.length }
+    const result = new Uint8Array(len)
     let offset = 0
     for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length }
     return result
   }
 
-  return { page, build, measureText }
+  function buildStream(): ReadableStream<Uint8Array> {
+    const iter = emitChunks(finalize())
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const { done, value } = iter.next()
+        if (done) controller.close()
+        else controller.enqueue(value)
+      }
+    })
+  }
+
+  return { page, build, buildStream, measureText }
 }
 
 export function markdown(md: string, opts: { width?: number; height?: number; margin?: number } = {}): Uint8Array {

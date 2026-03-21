@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { pdf, measureText, markdown } from './index'
+import pdfDefault, { pdf, measureText, markdown } from './index'
 
 describe('pdf', () => {
   test('creates a valid PDF with header', () => {
@@ -844,5 +844,408 @@ describe('text with invalid color', () => {
     const str = new TextDecoder().decode(bytes)
     expect(str).toContain('0.000 0.000 0.000 rg')
     expect(str).toContain('(Hello) Tj')
+  })
+})
+
+describe('buildStream', () => {
+  async function collectStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = []
+    for await (const chunk of stream) chunks.push(chunk)
+    let len = 0
+    for (const c of chunks) len += c.length
+    const result = new Uint8Array(len)
+    let offset = 0
+    for (const c of chunks) { result.set(c, offset); offset += c.length }
+    return result
+  }
+
+  test('produces identical output to build()', async () => {
+    const doc1 = pdf()
+    doc1.page(ctx => {
+      ctx.text('Hello World', 50, 700, 12)
+      ctx.rect(50, 650, 200, 30, '#ff0000')
+    })
+    const buildResult = doc1.build()
+
+    const doc2 = pdf()
+    doc2.page(ctx => {
+      ctx.text('Hello World', 50, 700, 12)
+      ctx.rect(50, 650, 200, 30, '#ff0000')
+    })
+    const streamResult = await collectStream(doc2.buildStream())
+
+    expect(streamResult).toEqual(buildResult)
+  })
+
+  test('produces valid PDF header and trailer', async () => {
+    const doc = pdf()
+    doc.page(() => {})
+    const bytes = await collectStream(doc.buildStream())
+    const str = new TextDecoder().decode(bytes)
+    expect(str.startsWith('%PDF-1.4')).toBe(true)
+    expect(str).toContain('%%EOF')
+  })
+
+  test('streams multiple pages', async () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('Page 1', 50, 700, 12))
+    doc.page(ctx => ctx.text('Page 2', 50, 700, 12))
+    doc.page(ctx => ctx.text('Page 3', 50, 700, 12))
+    const bytes = await collectStream(doc.buildStream())
+    const str = new TextDecoder().decode(bytes)
+    expect(str).toContain('(Page 1) Tj')
+    expect(str).toContain('(Page 2) Tj')
+    expect(str).toContain('(Page 3) Tj')
+    expect(str).toContain('/Count 3')
+  })
+
+  test('streams with images (JPEG)', async () => {
+    const sof = new Uint8Array([
+      0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08,
+      0x00, 0x10, 0x00, 0x20, 0x03, 0x01, 0x22, 0x00
+    ])
+    const doc1 = pdf()
+    doc1.page(ctx => ctx.image(sof, 50, 600, 100, 50))
+    const buildResult = doc1.build()
+
+    const doc2 = pdf()
+    doc2.page(ctx => ctx.image(sof, 50, 600, 100, 50))
+    const streamResult = await collectStream(doc2.buildStream())
+
+    expect(streamResult).toEqual(buildResult)
+  })
+
+  test('throws if no pages added', () => {
+    const doc = pdf()
+    expect(() => doc.buildStream()).toThrow('PDF must have at least one page')
+  })
+
+  test('throws if called twice', async () => {
+    const doc = pdf()
+    doc.page(() => {})
+    doc.buildStream()
+    expect(() => doc.buildStream()).toThrow('build() can only be called once')
+  })
+
+  test('throws if build() already called', () => {
+    const doc = pdf()
+    doc.page(() => {})
+    doc.build()
+    expect(() => doc.buildStream()).toThrow('build() can only be called once')
+  })
+
+  test('emits chunks incrementally', async () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('Test', 50, 700, 12))
+    const stream = doc.buildStream()
+    const reader = stream.getReader()
+    const chunks: Uint8Array[] = []
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+    }
+    expect(chunks.length).toBeGreaterThan(1)
+  })
+
+  test('build() throws after buildStream()', () => {
+    const doc = pdf()
+    doc.page(() => {})
+    doc.buildStream()
+    expect(() => doc.build()).toThrow('build() can only be called once')
+  })
+})
+
+describe('default export', () => {
+  test('default export is pdf function', () => {
+    expect(pdfDefault).toBe(pdf)
+  })
+})
+
+describe('pdfString escaping', () => {
+  test('escapes carriage return', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('line\rone', 50, 700, 12))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('(line\\rone) Tj')
+  })
+
+  test('escapes newline', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('line\ntwo', 50, 700, 12))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('(line\\ntwo) Tj')
+  })
+})
+
+describe('color edge cases', () => {
+  test('rect with none color is no-op', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.rect(0, 0, 100, 100, 'none'))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).not.toContain(' re')
+  })
+
+  test('line with none stroke is no-op', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.line(0, 0, 100, 100, 'none'))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).not.toContain(' m')
+    expect(str).not.toContain(' l')
+  })
+
+  test('line with invalid color is no-op', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.line(0, 0, 100, 100, 'garbage'))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).not.toContain(' m')
+  })
+
+  test('rect with empty string color is no-op', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.rect(0, 0, 100, 100, ''))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).not.toContain(' re')
+  })
+
+  test('parses hex without # prefix', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.rect(0, 0, 100, 100, 'ff0000'))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('1.000 0.000 0.000 rg')
+  })
+})
+
+describe('text defaults and alignment edge cases', () => {
+  test('uses black when no color option given', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('Hi', 50, 700, 12))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('0.000 0.000 0.000 rg')
+  })
+
+  test('center align without width has no effect', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('Hi', 50, 700, 12, { align: 'center' }))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('50.00 700.00 Td')
+  })
+
+  test('right align without width has no effect', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('Hi', 50, 700, 12, { align: 'right' }))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('50.00 700.00 Td')
+  })
+})
+
+describe('link edge cases', () => {
+  test('underline with invalid color is no-op', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.link('https://example.com', 50, 700, 100, 20, { underline: 'badcolor' }))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('/URI (https://example.com)')
+    expect(str).not.toContain('702.00 m')
+  })
+
+  test('link URL with special characters is escaped', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.link('https://example.com/path?a=1&b=(2)', 50, 700, 100, 20))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('/URI (https://example.com/path?a=1&b=\\(2\\))')
+  })
+})
+
+describe('image edge cases', () => {
+  test('multiple images on same page get unique names', () => {
+    const sof = new Uint8Array([
+      0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08,
+      0x00, 0x10, 0x00, 0x20, 0x03, 0x01, 0x22, 0x00
+    ])
+    const doc = pdf()
+    doc.page(ctx => {
+      ctx.image(sof, 50, 600, 100, 50)
+      ctx.image(sof, 50, 500, 100, 50)
+    })
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('/Im0 Do')
+    expect(str).toContain('/Im1 Do')
+  })
+
+  test('progressive JPEG (SOF2 marker) is parsed', () => {
+    const progressive = new Uint8Array([
+      0xFF, 0xD8, 0xFF, 0xC2, 0x00, 0x0B, 0x08,
+      0x00, 0x10, 0x00, 0x20, 0x03, 0x01, 0x22, 0x00
+    ])
+    const doc = pdf()
+    doc.page(ctx => ctx.image(progressive, 50, 600, 100, 50))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('/Width 32')
+    expect(str).toContain('/Height 16')
+    expect(str).toContain('/ColorSpace /DeviceRGB')
+  })
+
+  test('JPEG with SOS before SOF throws', () => {
+    const sosFirst = new Uint8Array([
+      0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02
+    ])
+    const doc = pdf()
+    doc.page(ctx => {
+      expect(() => ctx.image(sosFirst, 0, 0, 100, 100)).toThrow('no valid SOF marker')
+    })
+    doc.build()
+  })
+
+  test('single byte data throws', () => {
+    const doc = pdf()
+    doc.page(ctx => {
+      expect(() => ctx.image(new Uint8Array([0xFF]), 0, 0, 100, 100)).toThrow('missing SOI marker')
+    })
+    doc.build()
+  })
+
+  test('JPEG with non-FF bytes skipped before marker', () => {
+    // SOI, then some non-0xFF byte, then SOF0
+    const withGarbage = new Uint8Array([
+      0xFF, 0xD8,
+      0x00, // non-FF byte, should be skipped
+      0xFF, 0xC0, 0x00, 0x0B, 0x08,
+      0x00, 0x08, 0x00, 0x10, 0x03, 0x01, 0x22, 0x00
+    ])
+    const doc = pdf()
+    doc.page(ctx => ctx.image(withGarbage, 50, 600, 100, 50))
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).toContain('/Width 16')
+    expect(str).toContain('/Height 8')
+  })
+})
+
+describe('markdown edge cases', () => {
+  test('*** horizontal rule', () => {
+    const str = new TextDecoder().decode(markdown('***'))
+    expect(str).toContain('S')
+  })
+
+  test('___ horizontal rule', () => {
+    const str = new TextDecoder().decode(markdown('___'))
+    expect(str).toContain('S')
+  })
+
+  test('custom margin', () => {
+    const bytes = markdown('Hello', { margin: 50 })
+    expect(bytes).toBeInstanceOf(Uint8Array)
+    expect(bytes.length).toBeGreaterThan(0)
+  })
+
+  test('multi-digit ordered list number', () => {
+    const str = new TextDecoder().decode(markdown('12. Twelfth item'))
+    expect(str).toContain('12.')
+    expect(str).toContain('Twelfth item')
+  })
+
+  test('consecutive blank lines collapse', () => {
+    const str = new TextDecoder().decode(markdown('Hello\n\n\n\nWorld'))
+    const tjCount = (str.match(/\) Tj/g) || []).length
+    expect(tjCount).toBe(2)
+  })
+
+  test('heading after paragraph has spacing', () => {
+    const bytes = markdown('Some text\n\n## Heading')
+    const str = new TextDecoder().decode(bytes)
+    expect(str).toContain('(Some text) Tj')
+    expect(str).toContain('(Heading) Tj')
+    expect(str).toContain('/F1 16 Tf')
+  })
+
+  test('very long word is force-broken', () => {
+    const longWord = 'a'.repeat(200)
+    const str = new TextDecoder().decode(markdown(longWord))
+    const tjCount = (str.match(/\) Tj/g) || []).length
+    expect(tjCount).toBeGreaterThan(1)
+  })
+
+  test('bullet list continuation wraps correctly', () => {
+    const longBullet = '- ' + 'word '.repeat(50)
+    const str = new TextDecoder().decode(markdown(longBullet))
+    const tjCount = (str.match(/\) Tj/g) || []).length
+    expect(tjCount).toBeGreaterThan(1)
+  })
+
+  test('ordered list continuation wraps correctly', () => {
+    const longItem = '1. ' + 'word '.repeat(50)
+    const str = new TextDecoder().decode(markdown(longItem))
+    const tjCount = (str.match(/\) Tj/g) || []).length
+    expect(tjCount).toBeGreaterThan(1)
+  })
+
+  test('heading that wraps to multiple lines', () => {
+    const longHeading = '# ' + 'word '.repeat(30)
+    const str = new TextDecoder().decode(markdown(longHeading))
+    const tjCount = (str.match(/\) Tj/g) || []).length
+    expect(tjCount).toBeGreaterThan(1)
+    expect(str).toContain('/F1 22 Tf')
+  })
+
+  test('only whitespace input produces valid PDF', () => {
+    const bytes = markdown('   \n   \n   ')
+    const str = new TextDecoder().decode(bytes)
+    expect(str.startsWith('%PDF-1.4')).toBe(true)
+    expect(str).toContain('%%EOF')
+  })
+})
+
+describe('measureText on builder', () => {
+  test('builder exposes measureText', () => {
+    const doc = pdf()
+    expect(doc.measureText).toBe(measureText)
+    expect(doc.measureText('Hi', 12)).toBe(measureText('Hi', 12))
+  })
+})
+
+describe('page with no drawing operations', () => {
+  test('empty page has no Annots', () => {
+    const doc = pdf()
+    doc.page(() => {})
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).not.toContain('/Annots')
+  })
+
+  test('empty page has no XObject', () => {
+    const doc = pdf()
+    doc.page(() => {})
+    const str = new TextDecoder().decode(doc.build())
+    expect(str).not.toContain('/XObject')
+  })
+})
+
+describe('xref table correctness', () => {
+  test('xref offsets are valid numbers', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('Test', 50, 700, 12))
+    const str = new TextDecoder().decode(doc.build())
+    const xrefSection = str.slice(str.indexOf('xref'))
+    const offsetLines = xrefSection.split('\n').filter(l => /^\d{10} \d{5} [fn] $/.test(l))
+    expect(offsetLines.length).toBeGreaterThan(1)
+    for (const line of offsetLines) {
+      const offset = parseInt(line.slice(0, 10))
+      expect(offset).toBeGreaterThanOrEqual(0)
+      expect(Number.isNaN(offset)).toBe(false)
+    }
+  })
+
+  test('each object offset points to correct location', () => {
+    const doc = pdf()
+    doc.page(ctx => ctx.text('Hello', 50, 700, 12))
+    const bytes = doc.build()
+    const str = new TextDecoder().decode(bytes)
+    const xrefSection = str.slice(str.indexOf('xref'))
+    const lines = xrefSection.split('\n')
+    const entryLines = lines.filter(l => /^\d{10} \d{5} n $/.test(l))
+    for (let i = 0; i < entryLines.length; i++) {
+      const offset = parseInt(entryLines[i].slice(0, 10))
+      // Use byte-level slice since offsets are byte offsets
+      const chunk = new TextDecoder().decode(bytes.slice(offset, offset + 10))
+      expect(chunk).toMatch(/^\d+ 0 obj/)
+    }
   })
 })
